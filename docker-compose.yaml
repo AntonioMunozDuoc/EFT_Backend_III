@@ -1,0 +1,432 @@
+# =============================================================================
+# Banco XYZ - EFT Semana 9
+# Orquesta TODA la plataforma con un solo comando:
+#
+#     docker compose up -d --build
+#
+# Infraestructura : MySQL (una base por microservicio), Kafka
+# Plataforma      : config-server, discovery-server (Eureka), auth-server (OAuth2)
+# Microservicios  : clientes-service, cuentas-service (x2), pagos-service (x2), batch-service
+# BFF             : bff-web, bff-mobile, bff-atm
+# Eventos         : audit-service (2 instancias en el grupo banco-auditoria)
+#
+# Escalado horizontal (sin tocar codigo):
+#     docker compose up -d --scale cuentas-service=3 --scale pagos-service=3
+# =============================================================================
+
+name: banco-xyz
+
+x-java-service: &java-service
+  restart: unless-stopped          # reinicio automatico ante fallos
+  networks:
+    - banco-net
+
+services:
+
+  # ---------------------------------------------------------------- INFRA ---
+
+  mysql:
+    image: mysql:8.4
+    container_name: banco-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-root123}
+    ports:
+      - "${MYSQL_HOST_PORT:-3307}:3306"      # 3307 en el host: evita choque con un MySQL local
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro   # crea las 4 bases (una por servicio)
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - banco-net
+
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: banco-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"                          # acceso desde el host (herramientas locales)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # INTERNAL: contenedores de la red del compose | EXTERNAL: host | CONTROLLER: quorum
+      KAFKA_LISTENERS: INTERNAL://:9094,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9094,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topico banco.movimientos con 3 particiones (auto-creado)
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - banco-net
+
+  # ------------------------------------------------------------ PLATAFORMA --
+
+  config-server:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: config-server/Dockerfile
+    image: bancoxyz/config-server
+    container_name: banco-config-server
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  discovery-server:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: discovery-server/Dockerfile
+    image: bancoxyz/discovery-server
+    container_name: banco-discovery-server
+    ports:
+      - "8761:8761"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8761/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  auth-server:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: auth-server/Dockerfile
+    image: bancoxyz/auth-server
+    container_name: banco-auth-server
+    ports:
+      - "9000:9000"
+    environment:
+      # Issuer fijo: es el valor del claim "iss" de todos los tokens
+      AUTH_ISSUER: http://auth-server:9000
+      WEB_CLIENT_SECRET: ${WEB_CLIENT_SECRET:-web-secret-dev}
+      MOBILE_CLIENT_SECRET: ${MOBILE_CLIENT_SECRET:-mobile-secret-dev}
+      ATM_CLIENT_SECRET: ${ATM_CLIENT_SECRET:-atm-secret-dev}
+      BFF_WEB_SECRET: ${BFF_WEB_SECRET:-bff-web-secret-dev}
+      BFF_MOBILE_SECRET: ${BFF_MOBILE_SECRET:-bff-mobile-secret-dev}
+      BFF_ATM_SECRET: ${BFF_ATM_SECRET:-bff-atm-secret-dev}
+      CUENTAS_SERVICE_SECRET: ${CUENTAS_SERVICE_SECRET:-cuentas-service-secret-dev}
+      PAGOS_SERVICE_SECRET: ${PAGOS_SERVICE_SECRET:-pagos-service-secret-dev}
+      BATCH_OPERATOR_SECRET: ${BATCH_OPERATOR_SECRET:-batch-operator-secret-dev}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/oauth2/jwks || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  # ----------------------------------------------------------- MICROSERVICIOS --
+
+  clientes-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: clientes-service/Dockerfile
+    image: bancoxyz/clientes-service
+    container_name: banco-clientes-service
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      DB_URL: jdbc:mysql://mysql:3306/banco_clientes?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: root
+      DB_PASSWORD: ${DB_PASSWORD:-root123}
+      SQL_INIT_MODE: always                       # carga datos base (data.sql)
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+    depends_on:
+      mysql:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8085/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  cuentas-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: cuentas-service/Dockerfile
+    image: bancoxyz/cuentas-service
+    deploy:
+      replicas: 2                 # escalado horizontal: Eureka + LoadBalancer reparten
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      DB_URL: jdbc:mysql://mysql:3306/banco_cuentas?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: root
+      DB_PASSWORD: ${DB_PASSWORD:-root123}
+      SQL_INIT_MODE: always                       # carga datos base (data.sql)
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+      CUENTAS_SERVICE_SECRET: ${CUENTAS_SERVICE_SECRET:-cuentas-service-secret-dev}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+      clientes-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8084/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  pagos-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: pagos-service/Dockerfile
+    image: bancoxyz/pagos-service
+    deploy:
+      replicas: 2                 # escalado horizontal: Eureka + LoadBalancer reparten
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      DB_URL: jdbc:mysql://mysql:3306/banco_pagos?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: root
+      DB_PASSWORD: ${DB_PASSWORD:-root123}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+      PAGOS_SERVICE_SECRET: ${PAGOS_SERVICE_SECRET:-pagos-service-secret-dev}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      cuentas-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8086/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  batch-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: batch-service/Dockerfile
+    image: bancoxyz/batch-service
+    container_name: banco-batch-service
+    ports:
+      - "8087:8087"
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      DB_URL: jdbc:mysql://mysql:3306/banco_batch?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: root
+      DB_PASSWORD: ${DB_PASSWORD:-root123}
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+      BATCH_REPORTS_DIR: /reports
+    depends_on:
+      mysql:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+    volumes:
+      - batch-reports:/reports
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8087/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ----------------------------------------------------------------- BFF ---
+
+  bff-web:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: bff-web/Dockerfile
+    image: bancoxyz/bff-web
+    container_name: banco-bff-web
+    ports:
+      - "8081:8081"
+    environment:
+      SSL_ENABLED: "false"                        # trafico interno de la red del compose
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+      BFF_WEB_SECRET: ${BFF_WEB_SECRET:-bff-web-secret-dev}
+    depends_on:
+      cuentas-service:
+        condition: service_healthy
+      clientes-service:
+        condition: service_healthy
+      pagos-service:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  bff-mobile:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: bff-mobile/Dockerfile
+    image: bancoxyz/bff-mobile
+    container_name: banco-bff-mobile
+    ports:
+      - "8082:8082"
+    environment:
+      SSL_ENABLED: "false"                        # trafico interno de la red del compose
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+      BFF_MOBILE_SECRET: ${BFF_MOBILE_SECRET:-bff-mobile-secret-dev}
+    depends_on:
+      cuentas-service:
+        condition: service_healthy
+      clientes-service:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  bff-atm:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: bff-atm/Dockerfile
+    image: bancoxyz/bff-atm
+    container_name: banco-bff-atm
+    ports:
+      - "8083:8083"
+    environment:
+      SSL_ENABLED: "false"                        # trafico interno de la red del compose
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      AUTH_ISSUER: http://auth-server:9000
+      AUTH_JWK_SET_URI: http://auth-server:9000/oauth2/jwks
+      AUTH_TOKEN_URI: http://auth-server:9000/oauth2/token
+      BFF_ATM_SECRET: ${BFF_ATM_SECRET:-bff-atm-secret-dev}
+    depends_on:
+      cuentas-service:
+        condition: service_healthy
+      pagos-service:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  # ---------------------------------------------------------------- EVENTOS -
+
+  # Dos instancias del mismo grupo (banco-auditoria): Kafka reparte las 3 particiones entre ambas
+  audit-service-1:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: audit-service/Dockerfile
+    image: bancoxyz/audit-service
+    container_name: banco-audit-1
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      AUDIT_INSTANCE: auditoria-1
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  audit-service-2:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: audit-service/Dockerfile
+    image: bancoxyz/audit-service
+    container_name: banco-audit-2
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      AUDIT_INSTANCE: auditoria-2
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+networks:
+  banco-net:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  kafka-data:
+  batch-reports:

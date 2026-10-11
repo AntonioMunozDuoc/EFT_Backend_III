@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://bancoxyz.com/contracts/movimiento-evento/1.0",
+  "title": "MovimientoEvento",
+  "description": "Evento publicado en el topico banco.movimientos despues del COMMIT de cada movimiento. Version del contrato: 1.x (cambios compatibles solo agregan campos opcionales).",
+  "type": "object",
+  "required": [
+    "eventId",
+    "version",
+    "tipoEvento",
+    "movimientoId",
+    "cuentaId",
+    "tipoMovimiento",
+    "monto",
+    "saldoResultante",
+    "fechaMovimiento",
+    "fechaEvento"
+  ],
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "description": "Identificador unico del evento (UUID). Clave de idempotencia del consumidor.",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "version": {
+      "type": "string",
+      "description": "Version del contrato. Los consumidores v1 aceptan 1.x.",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "tipoEvento": {
+      "type": "string",
+      "enum": ["DEPOSITO_REALIZADO", "RETIRO_REALIZADO", "COMPRA_REALIZADA"]
+    },
+    "movimientoId": { "type": "integer", "minimum": 1 },
+    "cuentaId": { "type": "integer", "minimum": 1 },
+    "tipoMovimiento": {
+      "type": "string",
+      "enum": ["deposito", "retiro", "compra"]
+    },
+    "monto": {
+      "type": "number",
+      "description": "Positivo en depositos; negativo en retiros y compras."
+    },
+    "saldoResultante": { "type": "number", "minimum": 0 },
+    "fechaMovimiento": { "type": "string", "format": "date" },
+    "fechaEvento": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": { "properties": { "tipoEvento": { "const": "DEPOSITO_REALIZADO" } }, "required": ["tipoEvento"] },
+      "then": { "properties": { "monto": { "exclusiveMinimum": 0 }, "tipoMovimiento": { "const": "deposito" } } }
+    },
+    {
+      "if": { "properties": { "tipoEvento": { "const": "RETIRO_REALIZADO" } }, "required": ["tipoEvento"] },
+      "then": { "properties": { "monto": { "exclusiveMaximum": 0 }, "tipoMovimiento": { "const": "retiro" } } }
+    },
+    {
+      "if": { "properties": { "tipoEvento": { "const": "COMPRA_REALIZADA" } }, "required": ["tipoEvento"] },
+      "then": { "properties": { "monto": { "exclusiveMaximum": 0 }, "tipoMovimiento": { "const": "compra" } } }
+    }
+  ]
+}

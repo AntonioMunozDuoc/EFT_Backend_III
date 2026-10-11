@@ -1,0 +1,74 @@
+package com.bancoxyz.cuentas.config;
+
+import com.bancoxyz.common.http.ServiceIdLoadBalancerInterceptor;
+import com.bancoxyz.common.resilience.ResilientCall;
+import com.bancoxyz.common.security.ClientCredentialsTokenProvider;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.client.loadbalancer.LoadBalancerClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
+
+import java.net.http.HttpClient;
+import java.time.Duration;
+
+/**
+ * Cliente HTTP hacia clientes-service: descubrimiento por Eureka + balanceo
+ * de carga del lado del cliente (Spring Cloud LoadBalancer) + token OAuth2.
+ */
+@Configuration
+public class RestClientConfig {
+
+    @Bean
+    public ClientCredentialsTokenProvider clientesTokenProvider(
+            @Value("${oauth2.client.token-uri}") String tokenUri,
+            @Value("${oauth2.client.client-id}") String clientId,
+            @Value("${oauth2.client.client-secret}") String clientSecret,
+            @Value("${oauth2.client.scope}") String scope,
+            @Value("${clientes.api.connect-timeout-ms:2000}") long connectMs,
+            @Value("${clientes.api.read-timeout-ms:3000}") long readMs) {
+
+        return new ClientCredentialsTokenProvider(
+                tokenUri, clientId, clientSecret, scope,
+                Duration.ofMillis(connectMs), Duration.ofMillis(readMs));
+    }
+
+    @Bean
+    public RestClient clientesRestClient(
+            LoadBalancerClient loadBalancerClient,
+            @Value("${clientes.api.base-url:http://clientes-service}") String baseUrl,
+            @Value("${clientes.api.connect-timeout-ms:2000}") long connectMs,
+            @Value("${clientes.api.read-timeout-ms:3000}") long readMs,
+            ClientCredentialsTokenProvider clientesTokenProvider) {
+
+        HttpClient httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofMillis(connectMs))
+                .build();
+
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(httpClient);
+        factory.setReadTimeout(Duration.ofMillis(readMs));
+
+        return RestClient.builder()
+                .baseUrl(baseUrl)
+                .requestFactory(factory)
+                .requestInterceptor(new ServiceIdLoadBalancerInterceptor(loadBalancerClient))
+                .requestInterceptor((request, body, execution) -> {
+                    request.getHeaders().setBearerAuth(clientesTokenProvider.getToken());
+                    return execution.execute(request, body);
+                })
+                .build();
+    }
+
+    @Bean
+    public ResilientCall clientesResilientCall(
+            @Value("${resilience.retry.max-attempts:3}") int maxIntentos,
+            @Value("${resilience.retry.wait-ms:300}") long esperaMs,
+            @Value("${resilience.bulkhead.max-concurrent-calls:10}") int maxConcurrentes,
+            @Value("${resilience.bulkhead.max-wait-ms:100}") long esperaBulkheadMs) {
+
+        return new ResilientCall("clientesApi", maxIntentos, Duration.ofMillis(esperaMs),
+                maxConcurrentes, Duration.ofMillis(esperaBulkheadMs));
+    }
+}
